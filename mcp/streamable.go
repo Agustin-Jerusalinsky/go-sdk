@@ -1589,10 +1589,17 @@ func (c *streamableClientConn) Write(ctx context.Context, msg jsonrpc.Message) e
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		// Don't wrap context cancellation - let jsonrpc2 handle it properly.
+		// Only wrap transient errors (timeouts, network issues) to prevent poisoning.
+		if ctx.Err() == nil {
+			return fmt.Errorf("%s: %w: %v", requestSummary, jsonrpc2.ErrRejected, err)
+		}
 		return fmt.Errorf("%s: %v", requestSummary, err)
 	}
 
 	if err := c.checkResponse(requestSummary, resp); err != nil {
+		// Don't wrap checkResponse errors - they may indicate fatal conditions
+		// (like 404 session terminated) that SHOULD poison the connection.
 		c.fail(err)
 		return err
 	}
