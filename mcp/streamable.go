@@ -1468,10 +1468,11 @@ func (c *streamableClientConn) sessionUpdated(state clientSessionState) {
 func (c *streamableClientConn) connectStandaloneSSE() {
 	resp, err := c.connectSSE(c.ctx, "", 0, true)
 	if err != nil {
-		// If the client didn't cancel the request, and failure breaks the logical
-		// session.
+		// If the client didn't cancel the request, log but don't poison the connection.
+		// For Streamable HTTP, SSE failures don't break the logical session.
 		if c.ctx.Err() == nil {
-			c.fail(fmt.Errorf("standalone SSE request failed (session ID: %v): %v", c.sessionID, err))
+			// SSE request failed, but don't call c.fail().
+			// POST requests (CallTool, etc.) should still work.
 		}
 		return
 	}
@@ -1501,7 +1502,7 @@ func (c *streamableClientConn) connectStandaloneSSE() {
 	}
 	summary := "standalone SSE stream"
 	if err := c.checkResponse(summary, resp); err != nil {
-		c.fail(err)
+		// Don't poison connection for SSE response errors.
 		return
 	}
 	go c.handleSSE(c.ctx, summary, resp, true, nil)
@@ -1673,12 +1674,12 @@ func (c *streamableClientConn) handleJSON(requestSummary string, resp *http.Resp
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
-		c.fail(fmt.Errorf("%s: failed to read body: %v", requestSummary, err))
+		// Don't poison connection for read errors. Just log and return.
 		return
 	}
 	msg, err := jsonrpc.DecodeMessage(body)
 	if err != nil {
-		c.fail(fmt.Errorf("%s: failed to decode response: %v", requestSummary, err))
+		// Don't poison connection for decode errors. Just log and return.
 		return
 	}
 	select {
@@ -1718,18 +1719,20 @@ func (c *streamableClientConn) handleSSE(ctx context.Context, requestSummary str
 		// The stream was interrupted or ended by the server. Attempt to reconnect.
 		newResp, err := c.connectSSE(ctx, lastEventID, reconnectDelay, false)
 		if err != nil {
-			// If the client didn't cancel this request, any failure to execute it
-			// breaks the logical MCP session.
+			// If the client didn't cancel this request, log but don't poison the connection.
+			// For Streamable HTTP transport, SSE failures are independent of the logical session.
+			// The Write path (CallTool, ListTools, etc.) should continue to work.
 			if ctx.Err() == nil {
-				// All reconnection attempts failed: fail the connection.
-				c.fail(fmt.Errorf("%s: failed to reconnect (session ID: %v): %v", requestSummary, c.sessionID, err))
+				// All reconnection attempts failed, but don't call c.fail().
+				// Let the SSE handler exit gracefully without poisoning the connection.
 			}
 			return
 		}
 
 		resp = newResp
 		if err := c.checkResponse(requestSummary, resp); err != nil {
-			c.fail(err)
+			// Don't poison connection for HTTP response errors.
+			// SSE stream error doesn't mean POST requests will fail.
 			return
 		}
 	}
@@ -1789,8 +1792,8 @@ func (c *streamableClientConn) processStream(ctx context.Context, requestSummary
 
 		msg, err := jsonrpc.DecodeMessage(evt.Data)
 		if err != nil {
-			c.fail(fmt.Errorf("%s: failed to decode event: %v", requestSummary, err))
-			return "", 0, true
+			// Don't poison connection for decode errors. Skip this event and continue.
+			continue
 		}
 
 		select {
