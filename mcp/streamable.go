@@ -15,14 +15,12 @@ import (
 	"maps"
 	"math"
 	"math/rand/v2"
-	"net"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
@@ -35,80 +33,6 @@ const (
 	protocolVersionHeader = "Mcp-Protocol-Version"
 	sessionIDHeader       = "Mcp-Session-Id"
 )
-
-// isRecoverableError determines if an error is transient and should not poison
-// the connection. Recoverable errors include timeouts, temporary network issues,
-// and server overload conditions.
-//
-// Fatal errors that should poison the connection include authentication failures,
-// protocol errors, and client bugs.
-func isRecoverableError(err error, statusCode int) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check for timeout errors (most common recoverable case)
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
-	}
-
-	// Check for temporary network errors
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		// Connection refused, reset, etc. during server restart
-		if errors.Is(opErr.Err, syscall.ECONNREFUSED) ||
-			errors.Is(opErr.Err, syscall.ECONNRESET) ||
-			errors.Is(opErr.Err, syscall.EPIPE) {
-			return true
-		}
-		// Temporary network errors
-		if opErr.Temporary() {
-			return true
-		}
-	}
-
-	// Check HTTP status codes (when available)
-	if statusCode > 0 {
-		switch statusCode {
-		// Recoverable server errors
-		case http.StatusServiceUnavailable, // 503
-			http.StatusBadGateway,          // 502
-			http.StatusGatewayTimeout,      // 504
-			http.StatusTooManyRequests:     // 429
-			return true
-
-		// Ambiguous but treat as recoverable with retries
-		case http.StatusInternalServerError: // 500
-			return true
-
-		// Fatal errors - authentication/authorization
-		case http.StatusUnauthorized, // 401
-			http.StatusForbidden: // 403
-			return false
-
-		// Fatal - session terminated (only fatal if session ID was sent)
-		case http.StatusNotFound: // 404
-			return false
-
-		// Fatal - client errors (bad request, method not allowed, etc.)
-		case http.StatusBadRequest,       // 400
-			http.StatusMethodNotAllowed,  // 405
-			http.StatusNotAcceptable,     // 406
-			http.StatusConflict,          // 409
-			http.StatusGone,              // 410
-			http.StatusUnsupportedMediaType: // 415
-			return false
-		}
-	}
-
-	// If we can't classify it, treat as recoverable to be safe
-	// (with retry limits to prevent infinite loops)
-	return true
-}
 
 // A StreamableHTTPHandler is an http.Handler that serves streamable MCP
 // sessions, as defined by the [MCP spec].
@@ -1665,25 +1589,14 @@ func (c *streamableClientConn) Write(ctx context.Context, msg jsonrpc.Message) e
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		// Check if this is a recoverable error (timeout, network issue, etc.)
-		// Recoverable errors should not poison the connection permanently.
-		if isRecoverableError(err, 0) {
-			// Wrap with ErrRejected so jsonrpc2 doesn't set writeErr
-			return fmt.Errorf("%s: %w: %v", requestSummary, jsonrpc2.ErrRejected, err)
-		}
-		return fmt.Errorf("%s: %v", requestSummary, err)
+		// Wrap with ErrRejected to prevent jsonrpc2 from poisoning the connection.
+		// This allows transient errors (timeouts, network issues) to be retried.
+		return fmt.Errorf("%s: %w: %v", requestSummary, jsonrpc2.ErrRejected, err)
 	}
 
 	if err := c.checkResponse(requestSummary, resp); err != nil {
-		// Only poison the connection for fatal errors
-		// Recoverable errors (503, timeouts, etc.) should not call c.fail()
-		if !isRecoverableError(err, resp.StatusCode) {
-			c.fail(err)
-		} else {
-			// For recoverable errors, wrap with ErrRejected
-			return fmt.Errorf("%w: %v", jsonrpc2.ErrRejected, err)
-		}
-		return err
+		// Wrap with ErrRejected to prevent connection poisoning.
+		return fmt.Errorf("%w: %v", jsonrpc2.ErrRejected, err)
 	}
 
 	if sessionID := resp.Header.Get(sessionIDHeader); sessionID != "" {
